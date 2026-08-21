@@ -33,6 +33,8 @@ Click the toolbar icon again to stop without copying. `Esc` cancels the open com
 
 ## Clipboard format
 
+**Note**: The `txt` codeblock fence is intentional as compatibility with most clients.
+
 ````
 ```txt
 <browser_annotations>

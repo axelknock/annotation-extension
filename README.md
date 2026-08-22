@@ -76,3 +76,7 @@ Restricted pages (`chrome://`, the Chrome Web Store, and similar) cannot be anno
 - `manifest.json` — Manifest V3, toolbar action **without** a popup so `chrome.action.onClicked` fires.
 - `service-worker.js` — injects `content.js`, captures the visible tab, updates the badge.
 - `content.js` — isolated-world picker UI in a closed shadow root so page CSS cannot restyle it.
+
+## Alternatives
+
+- [browser-annotations](https://github.com/wiebekaai/browser-annotations)

@@ -16,12 +16,15 @@
   const MAX_Z = "2147483647";
   const HIGHLIGHT = "#2563EB";
   const TEXT_LIMIT = 280;
+  const SELECTION_DRAG_THRESHOLD = 5;
 
   const state = {
     active: false,
     picking: false,
     hoverEl: null,
-    selectedEl: null,
+    selectedEls: [],
+    selectionDrag: null,
+    selectionFrame: null,
     annotations: [],
     nextNumber: 1,
     panelLeft: null,
@@ -37,6 +40,8 @@
     host: null,
     shadow: null,
     highlight: null,
+    selectionBox: null,
+    selectionHighlights: null,
     label: null,
     markers: null,
     panel: null,
@@ -74,7 +79,7 @@
     renderMarkers();
     document.documentElement.classList.add("ba-annotating");
     setPageCursor(true);
-    showToast("Hover an element, then click to comment");
+    showToast("Click an element or drag to select several");
     reportStatus();
   }
 
@@ -83,7 +88,8 @@
     state.active = false;
     state.picking = false;
     state.hoverEl = null;
-    state.selectedEl = null;
+    state.selectedEls = [];
+    resetSelectionDrag();
     state.editingNumber = null;
     hideComposer();
     bind(false);
@@ -121,6 +127,8 @@
     ui.host = host;
     ui.shadow = shadow;
     ui.highlight = shadow.querySelector(".highlight");
+    ui.selectionBox = shadow.querySelector(".selection-box");
+    ui.selectionHighlights = shadow.querySelector(".selection-highlights");
     ui.label = shadow.querySelector(".hover-label");
     ui.markers = shadow.querySelector(".markers");
     ui.panel = shadow.querySelector(".panel");
@@ -138,13 +146,15 @@
   function buildTree() {
     const root = h("div", { className: "root" }, [
       h("div", { className: "highlight hidden" }),
-      h("div", { className: "hover-label hidden" }),
+      h("div", { className: "selection-highlights" }),
+      h("div", { className: "selection-box hidden" }),
+      h("div", { className: "hover-label hidden", role: "status", "aria-live": "polite" }),
       h("div", { className: "markers" }),
       h("div", { className: "panel", style: { pointerEvents: "auto" } }, [
         h("div", { className: "panel-head" }, [
           h("div", {}, [
             h("div", { className: "title" }, ["Browser Annotations"]),
-            h("div", { className: "hint" }, ["Click an element · Esc cancels"])
+            h("div", { className: "hint" }, ["Click or drag to select · Esc cancels"])
           ]),
           h("button", { className: "icon-btn", type: "button", title: "Stop without copying", onclick: stop }, ["×"])
         ]),
@@ -196,10 +206,14 @@
     const method = on ? "addEventListener" : "removeEventListener";
     document[method]("pointermove", onPointerMove, true);
     document[method]("pointerdown", onPointerDown, true);
+    document[method]("pointerup", onPointerUp, true);
+    document[method]("pointercancel", onSelectionCancel, true);
+    document[method]("lostpointercapture", onSelectionCancel, true);
     document[method]("click", onClick, true);
     document[method]("keydown", onKeyDown, true);
     window[method]("scroll", onLayout, true);
     window[method]("resize", onLayout, true);
+    window[method]("blur", onSelectionCancel, true);
   }
 
   function isChromeEvent(event) {
@@ -239,6 +253,13 @@
   }
 
   function onPointerMove(event) {
+    if (state.selectionDrag) {
+      if (event.pointerId !== state.selectionDrag.pointerId) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      moveSelectionDrag(event);
+      return;
+    }
     if (!state.active || !state.picking || isChromeEvent(event)) return;
     const el = pickFromEvent(event);
     if (el === state.hoverEl) return;
@@ -248,16 +269,135 @@
 
   function onPointerDown(event) {
     if (!state.active || isChromeEvent(event)) return;
-    if (!state.picking) {
+    if (event.button !== 0 || event.isPrimary === false) return;
+    if (!state.picking || state.selectionDrag) {
       event.preventDefault();
-      event.stopPropagation();
+      event.stopImmediatePropagation();
       return;
     }
     const el = pickFromEvent(event);
-    if (!el) return;
     event.preventDefault();
-    event.stopPropagation();
-    openComposer(el);
+    event.stopImmediatePropagation();
+    state.selectionDrag = {
+      pointerId: event.pointerId,
+      startX: event.clientX + window.scrollX,
+      startY: event.clientY + window.scrollY,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      x: event.clientX,
+      y: event.clientY,
+      element: el,
+      active: false,
+      elements: []
+    };
+    try {
+      document.documentElement.setPointerCapture(event.pointerId);
+    } catch {
+      // The pointer can end before capture is acquired.
+    }
+  }
+
+  function moveSelectionDrag(event) {
+    const drag = state.selectionDrag;
+    drag.x = event.clientX;
+    drag.y = event.clientY;
+    if (!drag.active) {
+      drag.active = Math.hypot(
+        drag.x - drag.startClientX,
+        drag.y - drag.startClientY
+      ) >= SELECTION_DRAG_THRESHOLD;
+    }
+    if (drag.active && state.selectionFrame == null) {
+      state.selectionFrame = requestAnimationFrame(() => {
+        state.selectionFrame = null;
+        updateSelectionPreview();
+      });
+    }
+  }
+
+  function selectionRect(drag) {
+    const startX = drag.startX - window.scrollX;
+    const startY = drag.startY - window.scrollY;
+    return {
+      left: Math.min(startX, drag.x),
+      top: Math.min(startY, drag.y),
+      right: Math.max(startX, drag.x),
+      bottom: Math.max(startY, drag.y),
+      width: Math.abs(drag.x - startX),
+      height: Math.abs(drag.y - startY)
+    };
+  }
+
+  function elementsOverlapping(rect) {
+    const elements = [];
+    if (rect.width <= 0 || rect.height <= 0) return elements;
+    let enclosedParent = null;
+    for (const element of document.querySelectorAll("body *")) {
+      if (isOverlayNode(element) || enclosedParent?.contains(element)) continue;
+      const box = element.getBoundingClientRect();
+      if (
+        box.width <= 0 || box.height <= 0 ||
+        box.left >= rect.right || box.top >= rect.bottom ||
+        box.right <= rect.left || box.bottom <= rect.top
+      ) continue;
+      const style = getComputedStyle(element);
+      if (style.visibility !== "visible" || style.contentVisibility === "hidden") continue;
+      if (element.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) === false) continue;
+      // Prefer crossed children over a partially covered container around them.
+      while (elements.at(-1)?.contains(element)) elements.pop();
+      elements.push(element);
+      if (
+        box.left >= rect.left && box.top >= rect.top &&
+        box.right <= rect.right && box.bottom <= rect.bottom
+      ) enclosedParent = element;
+    }
+    return elements;
+  }
+
+  function updateSelectionPreview() {
+    const drag = state.selectionDrag;
+    if (!drag?.active) return;
+    drag.elements = elementsOverlapping(selectionRect(drag));
+    paintHover();
+  }
+
+  function resetSelectionDrag() {
+    const drag = state.selectionDrag;
+    state.selectionDrag = null;
+    if (state.selectionFrame != null) cancelAnimationFrame(state.selectionFrame);
+    state.selectionFrame = null;
+    if (drag && document.documentElement.hasPointerCapture(drag.pointerId)) {
+      document.documentElement.releasePointerCapture(drag.pointerId);
+    }
+    return drag;
+  }
+
+  function onPointerUp(event) {
+    const drag = state.selectionDrag;
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    moveSelectionDrag(event);
+    // Read layout again so the committed targets match the final rectangle.
+    updateSelectionPreview();
+    resetSelectionDrag();
+    const elements = drag.active ? drag.elements : drag.element ? [drag.element] : [];
+    const connected = elements.filter((element) => element.isConnected);
+    if (connected.length) {
+      openComposer(connected);
+    } else {
+      state.hoverEl = null;
+      paintHover();
+      if (drag.active) showToast("No elements overlap the selection");
+    }
+  }
+
+  function onSelectionCancel(event) {
+    if (!state.selectionDrag) return;
+    if (event.type !== "blur" && event.pointerId !== state.selectionDrag.pointerId) return;
+    resetSelectionDrag();
+    state.hoverEl = null;
+    paintHover();
   }
 
   function onClick(event) {
@@ -271,8 +411,9 @@
     if (!state.active) return;
     if (event.key === "Escape") {
       event.preventDefault();
-      if (state.editingNumber != null) cancelEdit();
-      else if (state.selectedEl) cancelComment();
+      if (state.selectionDrag) onSelectionCancel({ type: "blur" });
+      else if (state.editingNumber != null) cancelEdit();
+      else if (state.selectedEls.length) cancelComment();
       else stop();
       return;
     }
@@ -287,10 +428,12 @@
 
   function onLayout() {
     if (!state.active) return;
-    paintHover();
+    if (state.selectionDrag?.active) {
+      updateSelectionPreview();
+    } else paintHover();
     renderMarkers();
     clampPanel();
-    if (state.selectedEl) placeComposer(state.selectedEl.getBoundingClientRect());
+    if (state.selectedEls.length) placeComposer(elementsRect(state.selectedEls));
   }
 
   function bindPanelDrag() {
@@ -356,20 +499,39 @@
     applyPanelPosition(state.panelLeft, state.panelTop);
   }
 
-  function openComposer(el) {
+  function elementsRect(elements) {
+    const rects = elements.filter((el) => el.isConnected).map((el) => el.getBoundingClientRect());
+    if (!rects.length) return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
+    const bounds = rects.reduce((bounds, rect) => ({
+      left: Math.min(bounds.left, rect.left),
+      top: Math.min(bounds.top, rect.top),
+      right: Math.max(bounds.right, rect.right),
+      bottom: Math.max(bounds.bottom, rect.bottom)
+    }));
+    const { left, top, right, bottom } = bounds;
+    return { left, top, right, bottom, width: right - left, height: bottom - top };
+  }
+
+  function openComposer(elements) {
     state.picking = false;
-    state.selectedEl = el;
-    state.hoverEl = el;
+    state.selectedEls = elements;
+    state.hoverEl = null;
     paintHover();
     ui.composer.classList.remove("hidden");
-    ui.composer.querySelector(".composer-meta").textContent = cssSelector(el);
+    ui.composer.querySelector(".composer-kicker").textContent = elements.length === 1
+      ? "Comment on this element"
+      : `Comment on these ${elements.length} elements`;
+    const selectors = elements.map(cssSelector).join("\n");
+    const meta = ui.composer.querySelector(".composer-meta");
+    meta.textContent = selectors;
+    meta.title = selectors;
     ui.textarea.value = "";
-    placeComposer(el.getBoundingClientRect());
+    placeComposer(elementsRect(elements));
     ui.textarea.focus();
   }
 
   function cancelComment() {
-    state.selectedEl = null;
+    state.selectedEls = [];
     state.picking = true;
     hideComposer();
     paintHover();
@@ -378,26 +540,32 @@
   async function confirmComment(event) {
     event.preventDefault();
     const comment = ui.textarea.value.trim();
-    if (!comment || !state.selectedEl) {
+    const elements = state.selectedEls.filter((el) => el.isConnected);
+    if (!elements.length) {
+      cancelComment();
+      showToast("The selected elements are no longer on the page");
+      return;
+    }
+    if (!comment) {
       ui.textarea.focus();
       return;
     }
 
-    const el = state.selectedEl;
-    const rect = el.getBoundingClientRect();
     const number = state.nextNumber++;
     const annotation = {
       number,
       pageUrl: location.href,
       frame: window === window.top ? "top document" : "nested frame",
-      element: el,
-      elementText: elementText(el),
-      cssSelector: cssSelector(el),
-      domPath: domPath(el),
-      position: {
-        x: Math.round(rect.left),
-        y: Math.round(rect.top)
-      },
+      targets: elements.map((el) => {
+        const rect = el.getBoundingClientRect();
+        return {
+          element: el,
+          elementText: elementText(el),
+          cssSelector: cssSelector(el),
+          domPath: domPath(el),
+          position: { x: Math.round(rect.left), y: Math.round(rect.top) }
+        };
+      }),
       viewport: {
         width: window.innerWidth,
         height: window.innerHeight
@@ -407,7 +575,7 @@
 
     hideComposer();
     state.annotations.push(annotation);
-    state.selectedEl = null;
+    state.selectedEls = [];
     renderMarkers();
     renderPanel();
     reportStatus();
@@ -440,21 +608,46 @@
   }
 
   function paintHover() {
-    const el = state.selectedEl || state.hoverEl;
+    const drag = state.selectionDrag;
+    const elements = (drag?.active ? drag.elements : state.selectedEls).filter((el) => el.isConnected);
+    ui.selectionHighlights.replaceChildren();
+    ui.selectionBox.classList.add("hidden");
+    if (drag?.active || elements.length > 1) {
+      ui.highlight.classList.add("hidden");
+      const rect = drag?.active ? selectionRect(drag) : elementsRect(elements);
+      ui.selectionHighlights.replaceChildren(...elements.map((el) => {
+        return h("div", { className: "highlight", style: boxStyle(el.getBoundingClientRect()) });
+      }));
+      if (drag?.active) {
+        Object.assign(ui.selectionBox.style, boxStyle(rect));
+        ui.selectionBox.classList.remove("hidden");
+      }
+      paintLabel(`${elements.length} element${elements.length === 1 ? "" : "s"} selected`, rect);
+      return;
+    }
+    const el = elements[0] || state.hoverEl;
     if (!el || !el.isConnected) {
       ui.highlight.classList.add("hidden");
       ui.label.classList.add("hidden");
       return;
     }
     const rect = el.getBoundingClientRect();
-    Object.assign(ui.highlight.style, {
+    Object.assign(ui.highlight.style, boxStyle(rect));
+    ui.highlight.classList.remove("hidden");
+    paintLabel(cssSelector(el), rect);
+  }
+
+  function boxStyle(rect) {
+    return {
       left: `${rect.left}px`,
       top: `${rect.top}px`,
       width: `${Math.max(rect.width, 2)}px`,
       height: `${Math.max(rect.height, 2)}px`
-    });
-    ui.highlight.classList.remove("hidden");
-    ui.label.textContent = cssSelector(el);
+    };
+  }
+
+  function paintLabel(text, rect) {
+    if (ui.label.textContent !== text) ui.label.textContent = text;
     Object.assign(ui.label.style, {
       left: `${Math.max(8, rect.left)}px`,
       top: `${Math.max(8, rect.top - 22)}px`
@@ -464,17 +657,17 @@
 
   function renderMarkers() {
     ui.markers.replaceChildren(
-      ...state.annotations.map((item) => {
-        const el = item.element?.isConnected ? item.element : document.querySelector(item.cssSelector);
-        const rect = el?.getBoundingClientRect() || { left: item.position.x, top: item.position.y, width: 0 };
+      ...state.annotations.flatMap((item) => item.targets.map((target) => {
+        const el = resolveTarget(target);
+        const rect = el?.getBoundingClientRect() || { left: target.position.x, top: target.position.y, width: 0 };
         const marker = h("div", { className: "marker" }, [String(item.number)]);
-        const pos = markerViewportPos(item, rect);
+        const pos = markerViewportPos(target, rect);
         Object.assign(marker.style, {
           left: `${pos.left}px`,
           top: `${pos.top}px`
         });
         return marker;
-      })
+      }))
     );
   }
 
@@ -484,7 +677,7 @@
     updateFileChip();
     if (empty) {
       ui.list.replaceChildren(
-        h("div", { className: "empty" }, ["No comments yet. Click an element to add one."])
+        h("div", { className: "empty" }, ["No comments yet. Click an element or drag around several to add one."])
       );
       return;
     }
@@ -497,10 +690,12 @@
 
   function renderItem(item) {
     const editing = state.editingNumber === item.number;
+    const selectors = item.targets.map((target) => target.cssSelector).join(", ");
+    const label = item.targets.length === 1 ? selectors : `${item.targets.length} elements · ${selectors}`;
     return h("div", { className: `item${editing ? " editing" : ""}` }, [
       h("div", { className: "item-top" }, [
         h("span", { className: "badge" }, [String(item.number)]),
-        h("div", { className: "item-sel", title: item.cssSelector }, [item.cssSelector])
+        h("div", { className: "item-sel", title: selectors }, [label])
       ]),
       h("div", { className: "item-comment-box" }, [
         editing
@@ -634,8 +829,12 @@
 
   function annotatedElements() {
     return state.annotations
-      .map((item) => (item.element?.isConnected ? item.element : document.querySelector(item.cssSelector)))
+      .flatMap((item) => item.targets.map(resolveTarget))
       .filter((el) => el instanceof Element);
+  }
+
+  function resolveTarget(target) {
+    return target.element?.isConnected ? target.element : document.querySelector(target.cssSelector);
   }
 
   function commonAncestor(elements) {
@@ -663,7 +862,7 @@
   }
 
   function markerViewportPos(item, rect = null) {
-    const box = rect || (item.element?.isConnected ? item.element.getBoundingClientRect() : null);
+    const box = rect || resolveTarget(item)?.getBoundingClientRect();
     const left = box ? box.left + Math.min(box.width || 0, 18) - 10 : item.position.x;
     const top = box ? Math.max(4, box.top - 10) : item.position.y;
     return { left, top, size: 20 };
@@ -675,8 +874,8 @@
     let top = rect.top;
     let right = rect.right;
     let bottom = rect.bottom;
-    for (const item of state.annotations) {
-      const pos = markerViewportPos(item);
+    for (const target of state.annotations.flatMap((item) => item.targets)) {
+      const pos = markerViewportPos(target);
       left = Math.min(left, pos.left);
       top = Math.min(top, pos.top);
       right = Math.max(right, pos.left + pos.size);
@@ -694,6 +893,7 @@
   async function captureRegion(el) {
     const nodeRect = el.getBoundingClientRect();
     const cropRect = regionCaptureRect(el);
+    const composerHidden = ui.composer.classList.contains("hidden");
     Object.assign(ui.highlight.style, {
       left: `${nodeRect.left}px`,
       top: `${nodeRect.top}px`,
@@ -701,6 +901,8 @@
       height: `${Math.max(nodeRect.height, 2)}px`
     });
     ui.highlight.classList.remove("hidden");
+    ui.selectionHighlights.classList.add("hidden");
+    ui.selectionBox.classList.add("hidden");
     ui.panel.classList.add("hidden");
     ui.composer.classList.add("hidden");
     ui.label.classList.add("hidden");
@@ -719,6 +921,8 @@
     } finally {
       ui.panel.classList.remove("hidden");
       ui.markers.classList.remove("hidden");
+      ui.selectionHighlights.classList.remove("hidden");
+      ui.composer.classList.toggle("hidden", composerHidden);
       paintHover();
     }
   }
@@ -752,26 +956,28 @@
 
   function stampIndexes(ctx, scaleX, scaleY, originX, originY) {
     const scale = Math.min(scaleX, scaleY);
-    for (const item of state.annotations) {
-      const pos = markerViewportPos(item);
-      const cx = (pos.left + pos.size / 2) * scaleX - originX;
-      const cy = (pos.top + pos.size / 2) * scaleY - originY;
-      const radius = (pos.size / 2) * scale;
-      if (cx + radius < 0 || cy + radius < 0 || cx - radius > ctx.canvas.width || cy - radius > ctx.canvas.height) {
-        continue;
+    for (const { number, targets } of state.annotations) {
+      for (const target of targets) {
+        const pos = markerViewportPos(target);
+        const cx = (pos.left + pos.size / 2) * scaleX - originX;
+        const cy = (pos.top + pos.size / 2) * scaleY - originY;
+        const radius = (pos.size / 2) * scale;
+        if (cx + radius < 0 || cy + radius < 0 || cx - radius > ctx.canvas.width || cy - radius > ctx.canvas.height) {
+          continue;
+        }
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fillStyle = HIGHLIGHT;
+        ctx.fill();
+        ctx.lineWidth = 2 * scale;
+        ctx.strokeStyle = "#ffffff";
+        ctx.stroke();
+        ctx.fillStyle = "#ffffff";
+        ctx.font = `700 ${Math.max(10, Math.round(11 * scale))}px ui-sans-serif, system-ui, sans-serif`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(number), cx, cy + 0.5 * scale);
       }
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.fillStyle = HIGHLIGHT;
-      ctx.fill();
-      ctx.lineWidth = 2 * scale;
-      ctx.strokeStyle = "#ffffff";
-      ctx.stroke();
-      ctx.fillStyle = "#ffffff";
-      ctx.font = `700 ${Math.max(10, Math.round(11 * scale))}px ui-sans-serif, system-ui, sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "middle";
-      ctx.fillText(String(item.number), cx, cy + 0.5 * scale);
     }
   }
 
@@ -784,7 +990,12 @@
         document.documentElement.append(style);
       }
       // Apply only under body so the overlay host (a sibling of body) is unaffected.
-      style.textContent = `html.ba-annotating body, html.ba-annotating body * { cursor: crosshair !important; }`;
+      style.textContent = `html.ba-annotating body, html.ba-annotating body * {
+        cursor: crosshair !important;
+        user-select: none !important;
+        -webkit-user-select: none !important;
+        touch-action: none !important;
+      }`;
     } else {
       style?.remove();
     }
@@ -845,12 +1056,17 @@
   }
 
   function formatAnnotation(item) {
+    const targets = item.targets.map((target) => [
+      `css_selector:${target.cssSelector}`,
+      `dom_path:${target.domPath}`,
+      `element_position:${target.position.x}, ${target.position.y}`
+    ].join("\n"));
     return [
       "<annotation>",
       `index:${item.number}`,
-      `css_selector:${item.cssSelector}`,
-      `dom_path:${item.domPath}`,
-      `element_position:${item.position.x}, ${item.position.y}`,
+      item.targets.length === 1
+        ? targets[0]
+        : `<selected_elements>\n${targets.map((target) => `<element>\n${target}\n</element>`).join("\n")}\n</selected_elements>`,
       "<user_comment>",
       item.comment,
       "</user_comment>",
@@ -1011,6 +1227,8 @@
     }
     .hidden { display: none !important; }
     .highlight,
+    .selection-box,
+    .selection-highlights,
     .hover-label,
     .markers,
     .marker,
@@ -1024,6 +1242,12 @@
       background: rgba(37, 99, 235, 0.12);
       border-radius: 2px;
       box-shadow: 0 0 0 1px rgba(255,255,255,0.7) inset;
+    }
+    .selection-box {
+      position: fixed;
+      box-sizing: border-box;
+      border: 1px dashed ${HIGHLIGHT};
+      background: rgba(37, 99, 235, 0.04);
     }
     .hover-label {
       position: fixed;
@@ -1243,7 +1467,10 @@
       font-size: 10px;
       overflow: hidden;
       text-overflow: ellipsis;
-      white-space: nowrap;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      max-height: 96px;
+      overflow: auto;
     }
     textarea {
       width: 100%;

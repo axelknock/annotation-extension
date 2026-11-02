@@ -1,8 +1,14 @@
 {
   "name": "browser-annotations",
+  "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "test": "playwright test"
+    "test": "npm run test:selection && npm run test:annotations",
+    "test:selection": "playwright test",
+    "test:annotations": "node --test tests/content.test.cjs"
   },
   "devDependencies": {
     "@playwright/test": "^1.64.1"

@@ -68,6 +68,12 @@ test.beforeEach(async ({ page }) => {
         return { ok: true };
       }
     };
+    window.chrome.storage = {
+      local: {
+        async get() { return { annotationMode: "comment" }; },
+        async set() {}
+      }
+    };
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: {
@@ -150,6 +156,49 @@ test("previews and commits all overlapped targets, including a partial overlap",
     meta: "button#first\nbutton#second\nbutton#partial"
   });
   expect(await page.evaluate(() => window.pageActions)).toEqual([]);
+});
+
+test("collection mode gives each dragged target a stable reference", async ({ page }) => {
+  const modeSelect = await page.evaluateHandle(() => window.annotationRoot.querySelector(".mode-select"));
+  await modeSelect.asElement().selectOption("collection");
+  await beginDrag(page);
+  await page.mouse.up();
+  expect(await readUi(page)).toMatchObject({
+    composerVisible: false,
+    boxVisible: false,
+    items: 3,
+    markers: ["1", "2", "3"]
+  });
+  expect(await page.evaluate(() => window.annotationRoot.querySelector(".collection textarea").value))
+    .toBe("[element-1] [element-2] [element-3] ");
+  await page.mouse.click(90, 140);
+  expect((await readUi(page)).items).toBe(3);
+  expect(await page.evaluate(() => window.annotationRoot.querySelector(".collection textarea").value))
+    .toBe("[element-1] [element-2] [element-3] [element-1] ");
+  await clickOverlay(page, ".copy-btn");
+  const text = await page.evaluate(() => window.copiedText);
+  expect(text).toContain("annotation_count:3");
+  expect(text).not.toContain("<selected_elements>");
+  expect(text).toContain("ref:[element-1]\nindex:1\ncss_selector:button#first");
+  expect(text).toContain("ref:[element-2]\nindex:2\ncss_selector:button#second");
+  expect(text).toContain("ref:[element-3]\nindex:3\ncss_selector:button#partial");
+});
+
+test("collecting one target of a grouped comment creates a reference to that target", async ({ page }) => {
+  await beginDrag(page);
+  await page.mouse.up();
+  await saveComment(page);
+  const modeSelect = await page.evaluateHandle(() => window.annotationRoot.querySelector(".mode-select"));
+  await modeSelect.asElement().selectOption("collection");
+  await page.mouse.click(90, 140);
+  expect(await readUi(page)).toMatchObject({ items: 2, markers: ["1", "1", "1", "2"] });
+  expect(await page.evaluate(() => window.annotationRoot.querySelector(".collection textarea").value))
+    .toBe("[element-2] ");
+  await clickOverlay(page, ".copy-btn");
+  const text = await page.evaluate(() => window.copiedText);
+  expect(text).toContain("<selected_elements>");
+  expect(text).toContain("Align these elements");
+  expect(text).toContain("ref:[element-2]\nindex:2\ncss_selector:button#first");
 });
 
 for (const [name, from, to] of [

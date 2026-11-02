@@ -2,8 +2,8 @@
   "manifest_version": 3,
   "name": "Browser Annotations",
   "version": "1.0.0",
-  "description": "Hover to outline page elements, leave comments, and copy structured annotations for LLM chats.",
-  "permissions": ["activeTab", "scripting", "clipboardWrite"],
+  "description": "Select page elements, add comments or collect references in one message, and copy structured annotations for coding agents.",
+  "permissions": ["activeTab", "scripting", "clipboardWrite", "storage"],
   "background": {
     "service_worker": "service-worker.js"
   },

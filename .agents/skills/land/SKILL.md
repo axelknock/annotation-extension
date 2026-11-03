@@ -70,6 +70,9 @@ git --no-optional-locks log -12 --oneline --decorate
 
 Inspect each worktree (a separate checkout). Determine the current branch,
 task changes, destination, and other checkouts that use these branches.
+Record the main worktree, the first record in the worktree list, as `land_main`.
+Record each linked task worktree used for this landing, including any added
+later. Do not include other worktrees in task cleanup.
 Stop if the landing scope or ownership is unclear. Do not include another
 branch's work because it shares the repository.
 
@@ -108,7 +111,8 @@ git ls-remote --symref origin HEAD refs/heads/master
 During an explicit landing request, fetch the destination, then compare the
 scoped changes with it. Check for an earlier successful landing, including one
 that combined or reapplied the original commits. If the changes are already
-present, verify that result and continue only with safe cleanup.
+present, verify that result as described below and continue only with safe
+cleanup. Skip candidate preparation and publication in that case.
 
 ## 2. Protect work and prepare the integration
 
@@ -117,10 +121,12 @@ tips. Protect relevant uncommitted work. Do not discard, stage, stash, commit,
 or otherwise alter unrelated work. Use a commit limited to task paths or an
 isolated branch when permitted. Stop if safe isolation is unavailable.
 
-If the checkout has no branch, create an unused branch under `codex/` before
-committing. Commit whenever the scoped work is coherent and its relevant checks
-pass. Do not stage the whole checkout without checking each included path.
-Complete applicable documentation, changelog, signing, and contribution duties.
+Prepare scoped commits on a task branch. If the checkout is detached or on
+`master`, create an unused branch under `codex/` before committing. Record each
+task branch and its tip. Commit whenever the scoped work is coherent and its
+relevant checks pass. Do not stage the whole checkout without checking each
+included path. Complete applicable documentation, changelog, signing, and
+contribution duties.
 
 Synchronize the destination:
 
@@ -252,7 +258,8 @@ operations. Never change the workflow silently to complete publication.
 
 ## 5. Verify the destination and report
 
-After the push, read the authoritative destination through both Git and GitHub:
+After publication, or if the change was already present, read the authoritative
+destination through both Git and GitHub:
 
 ```sh
 git ls-remote origin refs/heads/master
@@ -261,13 +268,24 @@ git fetch --no-tags origin \
   refs/heads/master:refs/remotes/origin/master
 ```
 
-Check that the candidate is present on `origin/master`. If later commits have
-advanced the destination, verify ancestry and that the intended changes remain.
-Compare the landed changes against the validated changes, including the final
-combined commit when the original commit identities changed. Inspect the
-published integration history for merge commits. Verify applicable hosted
-results for the landed revision; rerun relevant local checks against that exact
-revision if prior evidence does not cover it. A queued operation, prepared
+For a direct push, verify `land_candidate` in the destination history and
+record it as `land_landed`. If the task was already landed, identify and verify
+the full revision of the resulting integration commit as `land_landed`. For
+combined or reapplied commits, compare the result with the intended, validated
+task changes without requiring the original commit identifiers. Stop if the
+integration commit cannot be identified.
+
+Record the current verified destination tip as `land_sync`. Verify that the
+intended changes remain and that `land_landed` is in its history:
+
+```sh
+git merge-base --is-ancestor "$land_landed" "$land_sync"
+```
+
+Inspect the published integration history for merge commits. Verify applicable
+hosted results for the landed revision; rerun relevant local checks against that
+exact revision if prior evidence does not cover it. Check the current
+destination as well when required by the rules. A queued operation, prepared
 branch, or open PR does not establish landing.
 
 Report the repository and branch, landed revision and commit link, and actual
@@ -277,32 +295,90 @@ the specific next step. Inspect uncertain outcomes before another attempt.
 
 ## 6. Clean up only after verified landing
 
-Recheck task branch tips, complete landed changes, uncommitted work, and
-checkout use before deletion. Fetch the destination. If this checkout is clean
-and `master` is not used by another checkout, switch to `master` and update it
-with `git merge --ff-only origin/master`. Stop if its history cannot advance
-without rewriting work. Do not move another checkout's branch. If it is in use
-elsewhere, use a detached checkout of the verified destination only when safe.
-Report why this checkout did not switch to `master`.
+Recheck the authoritative destination before synchronization or task cleanup.
+If it moved, verify as above that it contains `land_landed` and the intended
+changes remain, then update `land_sync`. Never change `land_landed` to a later
+tip.
 
-Delete only this task's local branch after it is no longer checked out
-anywhere. Prefer `git branch -d`. If combined or reapplied commits prevent that
-check, verify the full landed changes and unchanged branch tip before using
-`git branch -D`.
-Do not infer complete landing from a matching commit message.
+Only the main worktree may check out `master`. Recheck its remote, branch,
+files, staging area (changes prepared for the next commit), and worktree use.
+Preserve untracked and ignored files when changing checkouts or fast-forwarding.
+If changing branches there would disrupt ongoing work, leave that checkout
+unchanged and report skipped checkout synchronization separately from landing.
+Never move `master` while it is checked out in another worktree to force
+synchronization. For blocked cleanup, preserve the work, continue safe steps,
+and report retained work and failures separately from landing success.
+
+For each recorded linked task worktree (an additional checkout) with no
+unrelated work, set `land_task_worktree` to its verified path. Detach (check out
+a commit without a branch) at `land_landed`:
+
+```sh
+git -C "$land_task_worktree" switch --no-overwrite-ignore \
+  --detach "$land_landed"
+```
+
+If unrelated committed or uncommitted work remains in a task checkout for this
+landing, create and check out an unused descriptive branch for that work at its
+current commit. Preserve all files and the staging area. Do not leave remaining
+work on the completed task's branch name. Leave the checkout unchanged if a
+switch cannot preserve the work or would disrupt ongoing work.
+
+When the main checkout is clean and has no unrelated work, check that `master`
+is not checked out elsewhere and can fast-forward to `land_sync`. Then run:
+
+```sh
+git -C "$land_main" switch --no-overwrite-ignore master &&
+  git -C "$land_main" merge --no-overwrite-ignore --ff-only "$land_sync"
+```
+
+If `master` does not exist, create it at `land_sync` in the main checkout.
+Stop these updates if a check or command fails.
+
+If the main checkout has unrelated uncommitted changes on `master`, choose an
+unused descriptive branch name as `land_remaining` and run:
+
+```sh
+git -C "$land_main" switch --no-overwrite-ignore -c "$land_remaining"
+```
+
+This keeps the same commit, all files, and the staging area. Leave the main
+checkout on the new branch with its edits uncommitted.
+
+When `master` is not checked out in any worktree, recheck the authoritative
+remote and advance the local branch with an explicit fetch:
+
+```sh
+git -C "$land_main" fetch origin refs/heads/master:refs/heads/master
+```
+
+This changes the branch's recorded commit, not the main checkout's branch,
+files, or staging area. Reject a non-fast-forward; never use force or
+`--update-head-ok` to bypass checkout protection. Verify that local `master`
+contains `land_landed`. If the fetch advanced beyond `land_sync`, verify the
+current destination as above before treating it as synchronized.
+
+Delete only verified local task branches after rechecking their tips, checkout
+use, and that all task changes landed. Preserve unrelated commits on the new
+branch before retiring an old task reference; they need not be published.
+Prefer `git branch -d`. Before using `git branch -D`, verify the unchanged tip
+and the same conditions, including when combined or reapplied commits prevent
+normal deletion. Do not infer landing from a matching commit message. Keep
+shared or uncertain references and branches still in use.
 
 This workflow normally publishes no task branch. If this task already has a
-remote branch, verify its recorded tip and complete landed changes before
-removing it. Use a deletion guarded by that exact remote tip:
+remote branch, recheck its tip and checkout use, and verify that all its work
+has landed before removing it. Set `land_task` to that verified branch and
+`land_remote_tip` to its verified tip. Use a deletion guarded by that exact
+remote tip:
 
 ```sh
 git push --force-with-lease="refs/heads/$land_task:$land_remote_tip" \
   origin ":refs/heads/$land_task"
 ```
 
-Set `land_task` and `land_remote_tip` only from the verified task identity.
 The lease is for this scoped deletion, never for rewriting a shared branch.
-If the tip changed or ownership is uncertain, retain the branch. Keep `master`,
-recovery branches, unrelated branches, and all worktree directories. Do not run
-worktree removal, pruning, or archive operations. Report retained work and
-cleanup failures separately from landing success.
+If the tip changed, any work is unlanded, the branch is still in use, or
+ownership is uncertain, retain the branch. Keep `master`, recovery branches,
+unrelated branches, and all worktree directories and local files. Do not
+remove, prune, or archive worktrees.
